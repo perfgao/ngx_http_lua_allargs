@@ -1,0 +1,381 @@
+diff -uNr --exclude=.git lua-nginx-module-0.10.11/config lua-nginx-module-0.10.11.01/config
+--- lua-nginx-module-0.10.11/config	2017-11-09 16:29:17.767000362 +0800
++++ lua-nginx-module-0.10.11.01/config	2017-11-09 14:56:05.398000323 +0800
+@@ -361,6 +361,7 @@
+             $ngx_addon_dir/src/ngx_http_lua_ssl_session_fetchby.c \
+             $ngx_addon_dir/src/ngx_http_lua_ssl.c \
+             $ngx_addon_dir/src/ngx_http_lua_log_ringbuf.c \
++            $ngx_addon_dir/src/ngx_http_lua_allargs.c \
+             "
+ 
+ HTTP_LUA_DEPS=" \
+@@ -422,6 +423,7 @@
+             $ngx_addon_dir/src/ngx_http_lua_ssl_session_fetchby.h \
+             $ngx_addon_dir/src/ngx_http_lua_ssl.h \
+             $ngx_addon_dir/src/ngx_http_lua_log_ringbuf.h \
++            $ngx_addon_dir/src/ngx_http_lua_allargs.h \
+             "
+ 
+ CFLAGS="$CFLAGS -DNDK_SET_VAR"
+diff -uNr --exclude=.git lua-nginx-module-0.10.11/src/ngx_http_lua_allargs.c lua-nginx-module-0.10.11.01/src/ngx_http_lua_allargs.c
+--- lua-nginx-module-0.10.11/src/ngx_http_lua_allargs.c	1970-01-01 08:00:00.000000000 +0800
++++ lua-nginx-module-0.10.11.01/src/ngx_http_lua_allargs.c	2017-11-09 16:27:14.651000342 +0800
+@@ -0,0 +1,314 @@
++
++/*
++ * Copyright (C) perfgao (perfgao)
++ * Copyright (C) Xiaozhe Wang (chaoslawful)
++ * Copyright (C) Yichun Zhang (agentzh)
++ */
++
++
++#ifndef DDEBUG
++#define DDEBUG 0
++#endif
++#include "ddebug.h"
++
++
++#include "ngx_http_lua_allargs.h"
++#include "ngx_http_lua_util.h"
++
++
++static int ngx_http_lua_ngx_req_get_uri_allargs(lua_State *L);
++static int ngx_http_lua_ngx_req_get_post_allargs(lua_State *L);
++
++
++static int
++ngx_http_lua_ngx_req_get_uri_allargs(lua_State *L)
++{
++    ngx_http_request_t          *r;
++    u_char                      *buf;
++    u_char                      *last;
++    int                          retval;
++    int                          n;
++    int                          max;
++
++    n = lua_gettop(L);
++
++    if (n != 0 && n != 1) {
++        return luaL_error(L, "expecting 0 or 1 arguments but seen %d", n);
++    }
++
++    if (n == 1) {
++        max = luaL_checkinteger(L, 1);
++        lua_pop(L, 1);
++
++    } else {
++        max = NGX_HTTP_LUA_MAX_ARGS;
++    }
++
++    r = ngx_http_lua_get_req(L);
++    if (r == NULL) {
++        return luaL_error(L, "no request object found");
++    }
++
++    ngx_http_lua_check_fake_request(L, r);
++
++    if (r->args.len == 0) {
++        lua_createtable(L, 0, 0);
++        return 1;
++    }
++
++    /* we copy r->args over to buf to simplify
++     * unescaping query arg keys and values */
++
++    buf = ngx_palloc(r->pool, r->args.len);
++    if (buf == NULL) {
++        return luaL_error(L, "no memory");
++    }
++
++    lua_createtable(L, 0, 4);
++
++    ngx_memcpy(buf, r->args.data, r->args.len);
++
++    last = buf + r->args.len;
++
++    retval = ngx_http_lua_parse_allargs(L, buf, last, max);
++
++    ngx_pfree(r->pool, buf);
++
++    return retval;
++}
++
++
++static int
++ngx_http_lua_ngx_req_get_post_allargs(lua_State *L)
++{
++    ngx_http_request_t          *r;
++    u_char                      *buf;
++    int                          retval;
++    size_t                       len;
++    ngx_chain_t                 *cl;
++    u_char                      *p;
++    u_char                      *last;
++    int                          n;
++    int                          max;
++
++    n = lua_gettop(L);
++
++    if (n != 0 && n != 1) {
++        return luaL_error(L, "expecting 0 or 1 arguments but seen %d", n);
++    }
++
++    if (n == 1) {
++        max = luaL_checkinteger(L, 1);
++        lua_pop(L, 1);
++
++    } else {
++        max = NGX_HTTP_LUA_MAX_ARGS;
++    }
++
++    r = ngx_http_lua_get_req(L);
++    if (r == NULL) {
++        return luaL_error(L, "no request object found");
++    }
++
++    ngx_http_lua_check_fake_request(L, r);
++
++    if (r->discard_body) {
++        lua_createtable(L, 0, 0);
++        return 1;
++    }
++
++    if (r->request_body == NULL) {
++        return luaL_error(L, "no request body found; "
++                          "maybe you should turn on lua_need_request_body?");
++    }
++
++    if (r->request_body->temp_file) {
++        lua_pushnil(L);
++        lua_pushliteral(L, "request body in temp file not supported");
++        return 2;
++    }
++
++    if (r->request_body->bufs == NULL) {
++        lua_createtable(L, 0, 0);
++        return 1;
++    }
++
++    /* we copy r->request_body->bufs over to buf to simplify
++     * unescaping query arg keys and values */
++
++    len = 0;
++    for (cl = r->request_body->bufs; cl; cl = cl->next) {
++        len += cl->buf->last - cl->buf->pos;
++    }
++
++    dd("post body length: %d", (int) len);
++
++    if (len == 0) {
++        lua_createtable(L, 0, 0);
++        return 1;
++    }
++
++    buf = ngx_palloc(r->pool, len);
++    if (buf == NULL) {
++        return luaL_error(L, "no memory");
++    }
++
++    lua_createtable(L, 0, 4);
++
++    p = buf;
++    for (cl = r->request_body->bufs; cl; cl = cl->next) {
++        p = ngx_copy(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
++    }
++
++    dd("post body: %.*s", (int) len, buf);
++
++    last = buf + len;
++
++    retval = ngx_http_lua_parse_allargs(L, buf, last, max);
++
++    ngx_pfree(r->pool, buf);
++
++    return retval;
++}
++
++
++int
++ngx_http_lua_parse_allargs(lua_State *L, u_char *buf, u_char *last, int max)
++{
++    u_char                      *p, *q;
++    u_char                      *src, *dst;
++    unsigned                     parsing_value;
++    size_t                       len, vallen;
++    int                          count = 0;
++    int                          top;
++
++    top = lua_gettop(L);
++
++    p = buf;
++
++    parsing_value = 0;
++    q = p;
++
++    while (p != last) {
++        if (*p == '=' && ! parsing_value) {
++            /* key data is between p and q */
++
++            src = q; dst = q;
++
++            ngx_http_lua_unescape_uri(&dst, &src, p - q,
++                                      NGX_UNESCAPE_URI_COMPONENT);
++
++            dd("pushing key %.*s", (int) (dst - q), q);
++
++            /* push the key */
++            lua_pushlstring(L, (char *) q, dst - q);
++
++            /* skip the current '=' char */
++            p++;
++
++            q = p;
++            parsing_value = 1;
++
++        } else if (*p == '&') {
++            /* reached the end of a key or a value, just save it */
++            src = q; dst = q;
++
++            ngx_http_lua_unescape_uri(&dst, &src, p - q,
++                                      NGX_UNESCAPE_URI_COMPONENT);
++
++            dd("pushing key or value %.*s", (int) (dst - q), q);
++
++            /* push the value or key */
++            lua_pushlstring(L, (char *) q, dst - q);
++
++            /* skip the current '&' char */
++            p++;
++
++            q = p;
++
++            if (parsing_value) {
++                /* end of the current pair's value */
++                parsing_value = 0;
++
++            } else {
++                /* the current parsing pair takes no value,
++                 * just push the value "true" */
++                dd("pushing boolean true");
++
++                lua_pushboolean(L, 1);
++            }
++
++            (void) lua_tolstring(L, -2, &len);
++            (void) lua_tolstring(L, -1, &vallen);
++
++            if (len == 0 && vallen == 0) {
++                /* ignore empty string key pairs */
++                dd("popping key and value...");
++                lua_pop(L, 2);
++
++            } else {
++                dd("setting table...");
++                ngx_http_lua_set_multi_value_table(L, top);
++            }
++
++            if (max > 0 && ++count == max) {
++                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
++                               "lua hit query args limit %d", max);
++
++                return 1;
++            }
++
++        } else {
++            p++;
++        }
++    }
++
++    if (p != q || parsing_value) {
++        src = q; dst = q;
++
++        ngx_http_lua_unescape_uri(&dst, &src, p - q,
++                                  NGX_UNESCAPE_URI_COMPONENT);
++
++        dd("pushing key or value %.*s", (int) (dst - q), q);
++
++        lua_pushlstring(L, (char *) q, dst - q);
++
++        if (!parsing_value) {
++            dd("pushing boolean true...");
++            lua_pushboolean(L, 1);
++        }
++
++        (void) lua_tolstring(L, -2, &len);
++        (void) lua_tolstring(L, -1, &vallen);
++
++        if (len == 0 && vallen == 0) {
++            /* ignore empty string key pairs */
++            dd("popping key and value...");
++            lua_pop(L, 2);
++
++        } else {
++            dd("setting table...");
++            ngx_http_lua_set_multi_value_table(L, top);
++        }
++    }
++
++    dd("gettop: %d", lua_gettop(L));
++    dd("type: %s", lua_typename(L, lua_type(L, 1)));
++
++    if (lua_gettop(L) != top) {
++        return luaL_error(L, "internal error: stack in bad state");
++    }
++
++    return 1;
++}
++
++
++void
++ngx_http_lua_inject_req_allargs_api(lua_State *L)
++{
++    lua_pushcfunction(L, ngx_http_lua_ngx_req_get_uri_allargs);
++    lua_setfield(L, -2, "get_uri_allargs");
++
++    lua_pushcfunction(L, ngx_http_lua_ngx_req_get_post_allargs);
++    lua_setfield(L, -2, "get_post_allargs");
++}
+diff -uNr --exclude=.git lua-nginx-module-0.10.11/src/ngx_http_lua_allargs.h lua-nginx-module-0.10.11.01/src/ngx_http_lua_allargs.h
+--- lua-nginx-module-0.10.11/src/ngx_http_lua_allargs.h	1970-01-01 08:00:00.000000000 +0800
++++ lua-nginx-module-0.10.11.01/src/ngx_http_lua_allargs.h	2017-11-09 14:51:36.110000343 +0800
+@@ -0,0 +1,21 @@
++
++/*
++ * Copyright (C) perfgao (perfgao)
++ * Copyright (C) Yichun Zhang (agentzh)
++ */
++
++
++#ifndef _NGX_HTTP_LUA_ALLARGS_H_INCLUDED_
++#define _NGX_HTTP_LUA_ALLARGS_H_INCLUDED_
++
++
++#include "ngx_http_lua_common.h"
++
++
++void ngx_http_lua_inject_req_allargs_api(lua_State *L);
++int ngx_http_lua_parse_allargs(lua_State *L, u_char *buf, u_char *last, int max);
++
++
++#endif /* _NGX_HTTP_LUA_ALLARGS_H_INCLUDED_ */
++
++/* vi:set ft=c ts=4 sw=4 et fdm=marker: */
+diff -uNr --exclude=.git lua-nginx-module-0.10.11/src/ngx_http_lua_util.c lua-nginx-module-0.10.11.01/src/ngx_http_lua_util.c
+--- lua-nginx-module-0.10.11/src/ngx_http_lua_util.c	2017-11-09 16:29:17.768000353 +0800
++++ lua-nginx-module-0.10.11.01/src/ngx_http_lua_util.c	2017-11-09 15:31:27.546000347 +0800
+@@ -52,6 +52,7 @@
+ #include "ngx_http_lua_ssl_certby.h"
+ #include "ngx_http_lua_ssl.h"
+ #include "ngx_http_lua_log_ringbuf.h"
++#include "ngx_http_lua_allargs.h"
+ 
+ 
+ #if 1
+@@ -2118,6 +2119,7 @@
+     ngx_http_lua_inject_req_method_api(L);
+     ngx_http_lua_inject_req_time_api(L);
+     ngx_http_lua_inject_req_misc_api(L);
++    ngx_http_lua_inject_req_allargs_api(L);
+ 
+     lua_setfield(L, -2, "req");
+ }
